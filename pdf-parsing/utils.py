@@ -1,65 +1,51 @@
 import fitz  # PyMuPDF
+import re
+import json
 from collections import defaultdict, Counter
 
-
-import re
-import fitz
-from collections import Counter
-
+# --- Utility Functions ---
 
 def is_date_line(text):
     return re.match(r"^\d{1,2}\s+\w+\s+\d{4}$", text.strip().upper())
 
-
 def is_date_like(text):
-    """
-    Returns True if the string is a single or multiple date line.
-    e.g. '18 JUNE 2013', '18 JUNE 2013 23 JULY 2013 6 NOV 2013'
-    """
     if not text:
         return False
-
-    # Normalize
     text = text.strip().upper()
-
-    # Extract all 3-part date patterns (like '18 JUNE 2013')
     date_pattern = re.compile(r"\d{1,2} [A-Z]{3,10} \d{4}")
     matches = date_pattern.findall(text)
-
-    # Count how many words are part of these matches
     total_words = len(text.split())
-    total_date_words = len(matches) * 3  # each match is 3 words
-
-    # If 90% or more of the words are dates, it's not a heading
+    total_date_words = len(matches) * 3
     return total_words > 0 and total_date_words / total_words >= 0.9 and len(matches) >= 2
 
 def merge_title_on_page1(page, size_threshold=11.5):
-    """Extracts merged title text from page 1 based on largest fonts."""
     blocks = page.get_text("dict")["blocks"]
-    title_parts = []
+    lines_by_size = defaultdict(list)
 
     for block in blocks:
         if block["type"] != 0:
             continue
         for line in block.get("lines", []):
-            line_text = ""
+            full_line = ""
             max_size = 0
             for span in line.get("spans", []):
+                text = span["text"].strip()
+                if not text:
+                    continue
                 size = round(span["size"], 1)
                 if size > size_threshold:
-                    line_text += span["text"].strip() + " "
+                    full_line += text + " "
                     max_size = max(max_size, size)
-            if line_text.strip():
-                title_parts.append((max_size, line_text.strip()))
+            if full_line.strip():
+                lines_by_size[max_size].append(full_line.strip())
 
-    # Sort by size descending and keep only top lines
-    title_parts.sort(reverse=True, key=lambda x: x[0])
-    top_lines = [t[1] for t in title_parts[:2]]  # take top 2 lines
+    if not lines_by_size:
+        return ""
+    top_size = max(lines_by_size)
+    top_lines = lines_by_size[top_size][:2]
     return "  ".join(top_lines).strip()
 
-
 def extract_outline_from_page(page):
-    """Returns list of (level, text) headings detected from a page."""
     blocks = page.get_text("dict")["blocks"]
     lines = []
     sizes = []
@@ -83,8 +69,7 @@ def extract_outline_from_page(page):
                 sizes.append(max_size)
 
     size_counter = Counter(sizes)
-    sorted_sizes = [s for s, _ in size_counter.items() if s > 11.5]
-    sorted_sizes.sort(reverse=True)
+    sorted_sizes = sorted([s for s in size_counter if s > 11.5], reverse=True)
     size_to_level = {}
     if len(sorted_sizes) > 0:
         size_to_level[sorted_sizes[0]] = "H1"
@@ -92,43 +77,67 @@ def extract_outline_from_page(page):
         size_to_level[sorted_sizes[1]] = "H2"
     if len(sorted_sizes) > 2:
         size_to_level[sorted_sizes[2]] = "H3"
+    if len(sorted_sizes) > 3:
+        size_to_level[sorted_sizes[3]] = "H4"
 
     headings = []
     buffer = ""
     last_level = None
     last_top = None
+
     for line in lines:
         level = size_to_level.get(line["size"])
+        text = line["text"]
 
-        # Additional pattern-based override (useful if font size fails)
-        if re.match(r"^\d+(\.\d+)*\s", line["text"]):
-            dots = line["text"].count(".")
-            if dots == 0:
-                level = "H1"
-            elif dots == 1:
-                level = "H2"
-            elif dots >= 2:
-                level = "H3"
+        match = re.match(r"^(\d+(\.\d+)*)(?=\s|:)", text)
+        if match:
+            dot_count = match.group(1).count(".")
+            level = f"H{min(dot_count + 1, 4)}"
 
         if not level:
+            if text.isupper() and len(text.split()) <= 6 and (sorted_sizes and line["size"] >= sorted_sizes[0] * 0.9):
+                level = "H1"
+            else:
+                continue
+
+        if is_date_line(text):
             continue
 
-        if is_date_line(line["text"]):
-            continue
-
-
-        if last_level == level and abs(line["top"] - last_top) <= 25:
-            buffer += " " + line["text"]
+        if last_level == level and abs(line["top"] - last_top) <= 25 and not re.match(r"^\d+(\.\d+)+\s", text):
+            buffer += " " + text
         else:
             if buffer:
-                headings.append((last_level, buffer.strip()))
-            buffer = line["text"]
+                merged = buffer.strip()
+                if not is_date_like(merged):
+                    headings.append((last_level, merged))
+            buffer = text
             last_level = level
             last_top = line["top"]
 
-    # Flush last
     if buffer:
-        merged_text = buffer.strip()
-        if not is_date_like(merged_text):
-            headings.append((last_level, merged_text))
+        merged = buffer.strip()
+        if not is_date_like(merged):
+            headings.append((last_level, merged))
+
     return headings
+
+# --- Main Extraction Wrapper ---
+
+def extract_outline_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    title = merge_title_on_page1(doc[0]) or "Untitled Document"
+    outline = []
+
+    for i, page in enumerate(doc):
+        headings = extract_outline_from_page(page)
+        for level, text in headings:
+            outline.append({
+                "level": level,
+                "text": text,
+                "page": i
+            })
+
+    return {
+        "title": title,
+        "outline": outline
+    }
