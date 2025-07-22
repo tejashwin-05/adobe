@@ -6,6 +6,11 @@ import re
 import fitz
 from collections import Counter
 
+
+def is_date_line(text):
+    return re.match(r"^\d{1,2}\s+\w+\s+\d{4}$", text.strip().upper())
+
+
 def is_date_like(text):
     """
     Returns True if the string is a single or multiple date line.
@@ -107,6 +112,10 @@ def extract_outline_from_page(page):
 
         if not level:
             continue
+
+        if is_date_line(line["text"]):
+            continue
+
 
         if last_level == level and abs(line["top"] - last_top) <= 25:
             buffer += " " + line["text"]
